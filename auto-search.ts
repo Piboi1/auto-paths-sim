@@ -1,14 +1,16 @@
 // Random search over AUTO routines for all four start positions: red right, red left, blue right, blue left.
 // Drop this file in scripts/ of caryden/ftc-biobuzz-sim.
-// Run: npx tsx scripts/auto-search.ts [candidates=200] [seeds=6] [workers=4] [rngSeed=1]
+// Run: npx tsx scripts/auto-search.ts [candidates=200] [seeds=6] [workers=CPU cores - 1] [rngSeed=1]
 //
 // Each candidate is the sim's default tree for that start position (wall-sweep-pair-right or -left) with randomly
 // changed numbers and steps. The partner and the other alliance run their default AUTO. A candidate is scored only on
-// AUTO: the alliance's LEAVE, AUTO PARK and TIP points, plus a small bonus for the elements still in the hoppers when
-// AUTO ends (a head start for TELEOP). The best 10 of each start position are printed and written to
-// auto-search-top10.json, each with its full tree, so you can load it in the sim.
+// AUTO, and ranked in this order (each tie-break only matters when the earlier numbers are equal):
+//   1. mean AUTO points (LEAVE + AUTO PARK + TIPs)       2. worst seed's AUTO points (reliability)
+//   3. time of the 4th TIP, earlier is better            4. elements still in the hoppers when AUTO ends
+// The best 10 of each start position are printed and written to auto-search-top10.json, each with its full tree.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 type Node = Record<string, any>;
@@ -17,7 +19,6 @@ type Alliance = 'red' | 'blue';
 const ROOT = path.resolve(import.meta.dirname, '..');
 const baseFile = (s: Side) => path.join(ROOT, `src/auto/trees/auto/wall-sweep-pair-${s}.json`);
 const args = process.argv.slice(2), isWorker = args.includes('--worker'), pos = args.filter(a => !a.startsWith('--'));
-const HOPPER_BONUS = 2; // points per element left in the hoppers when AUTO ends; a tie-breaker, not game points
 
 // ---- tree editing helpers ----
 function walk(n: Node, f: (n: Node) => void) { f(n); for (const k of ['sequence', 'parallel']) if (n[k]) n[k].children.forEach((c: Node) => walk(c, f)); }
@@ -55,7 +56,8 @@ const KINDS: Record<Side, Kind> = {
     }),
   },
   left: {
-    randomGenome: rng => ({ launchDx: -rand(rng, 0.5, 0.75), launchZ: rand(rng, 1.05, 1.3), headingDeg: Math.round(120 + rng() * 20), shots: rng() < 0.8 ? 4 : 3, flower: rng() < 0.75, flowerPush: rand(rng, 0.25, 0.45),
+    // headingDeg stays at 126 or more: below that the camera lost the rear CELL's tags in a test run.
+    randomGenome: rng => ({ launchDx: -rand(rng, 0.55, 0.65), launchZ: rand(rng, 1.15, 1.3), headingDeg: Math.round(126 + rng() * 7), shots: rng() < 0.8 ? 4 : 3, flower: rng() < 0.75, flowerPush: rand(rng, 0.25, 0.45),
       yawDeg: Math.round(20 + rng() * 20), tipWait: rand(rng, 1.5, 4, 0.1), midSweep: rng() < 0.7, lastCycle: rng() < 0.8, finishAt: rand(rng, 2.5, 5, 0.5) }),
     defaults: { launchDx: -0.62, launchZ: 1.17, headingDeg: 129.4, shots: 4, flower: true, flowerPush: 0.35, yawDeg: 30, tipWait: 3, midSweep: true, lastCycle: true, finishAt: 3 },
     build: make('left', (tree, g, set) => {
@@ -70,24 +72,25 @@ const KINDS: Record<Side, Kind> = {
 };
 
 // ---- scoring trees in the simulator (worker side) ----
-interface Row { id: string; auto: number; tips: number; hopper: number; leave: number; park: number; firstTip: number; score: number; error?: string }
+interface Row { id: string; auto: number; worst: number; fourTipRate: number; tip4: number; hopper: number; firstTip: number; error?: string }
 async function score(trees: Node[], seeds: number[], alliance: Alliance, slot: number): Promise<Row[]> {
   const RAPIER = (await import('@dimforge/rapier3d-compat')).default; await RAPIER.init();
   const { Coach } = await import('../src/auto/coach'); const { DT, Sim } = await import('../src/sim/world'); const { addAutoTree } = await import('../src/auto/onboard');
   const out: Row[] = [];
   for (const tree of trees) {
-    try { addAutoTree(tree); } catch (e) { out.push({ id: tree.id, auto: 0, tips: 0, hopper: 0, leave: 0, park: 0, firstTip: 0, score: -1, error: String(e).slice(0, 200) }); continue; }
-    let auto = 0, tips = 0, hop = 0, leave = 0, park = 0, firstTip = 0, tipRuns = 0;
+    try { addAutoTree(tree); } catch (e) { out.push({ id: tree.id, auto: 0, worst: 0, fourTipRate: 0, tip4: 30, hopper: 0, firstTip: 0, error: String(e).slice(0, 200) }); continue; }
+    let auto = 0, hop = 0, firstTip = 0, tipRuns = 0, worst = Infinity, four = 0, tip4 = 0;
     for (const seed of seeds) {
       const sim = new Sim(RAPIER, undefined, 'full', seed, { opponent: true, partners: true }); sim.start();
       const cs = sim.robots.map(r => { const c = new Coach(); if (r.alliance === alliance && r.slot === slot) c.autoOverride = tree.id; return c; });
-      let tipAt = -1;
-      while (sim.phase === 'auto') { sim.step(cs.map((c, i) => c.update(sim.view(i), DT)), cs.map(() => true)); if (tipAt < 0 && sim.hives[alliance].tips > 0) tipAt = 30 - sim.timer; }
-      const s = sim.score(alliance); auto += s.leave + s.autoPark + s.autoTips; tips += s.autoTips / 20; leave += s.leave; park += s.autoPark;
-      hop += sim.robots.filter(r => r.alliance === alliance).reduce((n, r) => n + r.carried.length, 0) / 2; if (tipAt >= 0) { firstTip += tipAt; tipRuns++; }
+      const tipTimes: number[] = [];
+      while (sim.phase === 'auto') { sim.step(cs.map((c, i) => c.update(sim.view(i), DT)), cs.map(() => true)); while (tipTimes.length < sim.hives[alliance].tips) tipTimes.push(30 - sim.timer); }
+      const s = sim.score(alliance), pts = s.leave + s.autoPark + s.autoTips; auto += pts; worst = Math.min(worst, pts);
+      hop += sim.robots.filter(r => r.alliance === alliance).reduce((n, r) => n + r.carried.length, 0) / 2;
+      if (tipTimes.length) { firstTip += tipTimes[0]; tipRuns++; } if (tipTimes.length >= 4) four++; tip4 += tipTimes[3] ?? 30; // a missing 4th TIP counts as 30 s
     }
     const n = seeds.length;
-    out.push({ id: tree.id, auto: auto / n, tips: tips / n, hopper: hop / n, leave: leave / n, park: park / n, firstTip: tipRuns ? firstTip / tipRuns : 0, score: auto / n + HOPPER_BONUS * hop / n });
+    out.push({ id: tree.id, auto: auto / n, worst, fourTipRate: four / n, tip4: tip4 / n, hopper: hop / n, firstTip: tipRuns ? firstTip / tipRuns : 0 });
   }
   return out;
 }
@@ -98,7 +101,7 @@ if (isWorker) {
 }
 
 // ---- orchestrator ----
-const [candArg = '200', seedArg = '6', workArg = '4', rngArg = '1'] = pos;
+const cores = (os.availableParallelism?.() ?? os.cpus().length), [candArg = '200', seedArg = '6', workArg = String(Math.max(1, cores - 1)), rngArg = '1'] = pos;
 let state = Number(rngArg) >>> 0;
 const rng = () => { state = (state + 0x6d2b79f5) >>> 0; let t = state; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 const nCand = Number(candArg), seeds = Array.from({ length: Number(seedArg) }, (_, k) => 3000 + 17 * k), nWork = Math.max(1, Number(workArg));
@@ -118,16 +121,19 @@ const runWorker = (file: string, alliance: Alliance, slot: number) => new Promis
   child.on('close', () => { try { done(JSON.parse(o.trim().split('\n').pop()!)); } catch { console.error(`worker for ${file} returned nothing`); done([]); } });
 });
 
+// Ranking key, rounded so that tiny differences count as ties and fall through to the next criterion.
+const key = (r: Row) => [Math.round(r.auto), Math.round(r.worst), -Math.round(r.tip4 * 2) / 2, Math.round(r.hopper * 2) / 2];
+const compare = (a: Row, b: Row) => { const x = key(a), y = key(b); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return y[i] - x[i]; return 0; };
 const report: Record<string, unknown[]> = {};
 for (const alliance of ['red', 'blue'] as Alliance[]) for (const side of ['right', 'left'] as Side[]) {
   const label = `${alliance} ${side}`, slot = side === 'right' ? 0 : 1, list = cands[side];
   const chunks = Array.from({ length: nWork }, (_, w) => list.filter((_, i) => i % nWork === w).map(c => c.tree));
   const files = chunks.map((c, w) => { const f = path.join(tmp, `${alliance}-${side}-${w}.json`); fs.writeFileSync(f, JSON.stringify(c)); return f; });
-  const rows = (await Promise.all(files.map(f => runWorker(f, alliance, slot)))).flat().filter(r => !r.error).sort((a, b) => b.score - a.score);
+  const rows = (await Promise.all(files.map(f => runWorker(f, alliance, slot)))).flat().filter(r => !r.error).sort(compare);
   const base = rows.find(r => r.id.endsWith('-000-default')), top = rows.slice(0, 10), byId = new Map(list.map(c => [c.id, c]));
-  console.log(`\n=== ${label} start: ${rows.length}/${nCand} candidates over ${seeds.length} seeds. Default AUTO ${base ? base.auto.toFixed(1) : '?'} pts, score ${base ? base.score.toFixed(1) : '?'} ===`);
-  console.log('rank  id                AUTO pts  TIPS  hopper  first TIP (s)  score');
-  top.forEach((r, i) => console.log(`${String(i + 1).padStart(4)}  ${r.id.padEnd(16)} ${r.auto.toFixed(1).padStart(8)}  ${r.tips.toFixed(2)}  ${r.hopper.toFixed(2).padStart(6)}  ${r.firstTip.toFixed(1).padStart(13)}  ${r.score.toFixed(1)}`));
+  console.log(`\n=== ${label} start: ${rows.length}/${nCand} candidates over ${seeds.length} seeds. Default AUTO ${base ? base.auto.toFixed(1) : '?'} pts ===`);
+  console.log('rank  id                AUTO pts  worst  4 TIPS  4th TIP (s)  hopper');
+  top.forEach((r, i) => console.log(`${String(i + 1).padStart(4)}  ${r.id.padEnd(16)} ${r.auto.toFixed(1).padStart(8)}  ${r.worst.toFixed(0).padStart(5)}  ${(r.fourTipRate * 100).toFixed(0).padStart(5)}%  ${r.tip4.toFixed(1).padStart(10)}  ${r.hopper.toFixed(2).padStart(6)}`));
   report[label] = top.map(r => ({ ...r, genome: byId.get(r.id)!.genome, tree: byId.get(r.id)!.tree }));
 }
 fs.rmSync(tmp, { recursive: true, force: true });
