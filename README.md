@@ -11,7 +11,7 @@ positions (red right, red left, blue right, blue left) and prints the top 10 of 
 3. Run:
 
    ```
-   npx tsx scripts/auto-search.ts [candidates=200] [seeds=6] [workers=CPU cores - 1] [rngSeed=1]
+   npx tsx scripts/auto-search.ts [candidates=200] [seeds=6] [workers=CPU cores - 1] [rngSeed=1] [--alliances=red]
    ```
 
    Start small, for example `40 4 4 1`. A full 200 x 6 run across all four starts may take about an hour (a rough guess).
@@ -26,6 +26,22 @@ positions (red right, red left, blue right, blue left) and prints the top 10 of 
   one tries different random candidates. Compare the `auto-search-top10.json` files afterwards.
 
 It writes `auto-search-top10.json` in the sim repo. Each entry has its settings and the full tree.
+
+## The shortlist, the backup and the robot being tested
+
+- **Red only by default.** Blue is the same field mirrored, and the first tests scored red and blue the same, so the
+  default run searches red and you mirror the winners for blue. Use `--alliances=red,blue` to run both.
+- **Shortlist.** Besides the top 10, each start position prints up to 3 routines with different launch spots or
+  different optional steps, each within 10 AUTO points of the best. That's the "couple with variety" to code first.
+- **Backup.** Each start position also prints a LEAVE-and-PARK only routine (`*-backup-leave-park`). Its score depends on
+  the partner's routine, because the default partner waits for the first TIP: use it as a fallback, not a ranking.
+- **Robot under test.** The sim's default robot is faster than a tuned 71.6 in/s robot (about 104 in/s planned top
+  speed), so the script matches the drive speed (`driveRpm` 410) by default. Set your real robot with an env var:
+  `BOT='{"driveRpm":410,"sizeIn":14,"massLb":20,"dualIntake":true}' npx tsx scripts/auto-search.ts 40 6`
+  (every field is in `BotSetup` in the sim's `src/setup.ts`). Partners and opponents stay at the sim default.
+- **Sanity columns.** `dist m` is the distance driven in AUTO and `top m/s` the top speed. A `check` line appears if a
+  shortlisted routine misses 4 TIPS on some seeds, has a late first TIP, or exceeds the robot's top speed.
+  These don't replace looking at the path: check that every pose is reachable and clear of obstacles for your robot.
 
 ## What it does
 

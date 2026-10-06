@@ -1,13 +1,20 @@
 // Random search over AUTO routines for all four start positions: red right, red left, blue right, blue left.
 // Drop this file in scripts/ of caryden/ftc-biobuzz-sim.
-// Run: npx tsx scripts/auto-search.ts [candidates=200] [seeds=6] [workers=CPU cores - 1] [rngSeed=1]
+// Run: npx tsx scripts/auto-search.ts [candidates=200] [seeds=6] [workers=CPU cores - 1] [rngSeed=1] [--alliances=red]
+//
+// By default only red is searched: blue is the same field mirrored, and the first tests scored blue the same as red.
+// Use --alliances=red,blue to run both. The tested robot is the sim's default robot with its drive speed matched to
+// your tuned max forward velocity (71.6 in/s, about 410 rpm at the wheel). Set the rest of your robot with an env var:
+//   BOT='{"driveRpm":410,"sizeIn":14,"massLb":20,"dualIntake":true}' npx tsx scripts/auto-search.ts 40 6
+// (see BotSetup in src/setup.ts for every field). Partners and opponents stay at the sim default.
 //
 // Each candidate is the sim's default tree for that start position (wall-sweep-pair-right or -left) with randomly
 // changed numbers and steps. The partner and the other alliance run their default AUTO. A candidate is scored only on
 // AUTO, and ranked in this order (each tie-break only matters when the earlier numbers are equal):
 //   1. mean AUTO points (LEAVE + AUTO PARK + TIPs)       2. worst seed's AUTO points (reliability)
 //   3. time of the 4th TIP, earlier is better            4. elements still in the hoppers when AUTO ends
-// The best 10 of each start position are printed and written to auto-search-top10.json, each with its full tree.
+// For each start position it prints the top 10, a short list of up to 3 routines with different structures (for
+// variety), and a LEAVE-and-PARK backup. Everything is written to auto-search-top10.json with the full trees.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,6 +24,8 @@ type Node = Record<string, any>;
 type Side = 'right' | 'left';
 type Alliance = 'red' | 'blue';
 const ROOT = path.resolve(import.meta.dirname, '..');
+// The robot under test: the sim's default robot with the drive speed matched to the tuned robot (see the header).
+const BOT: Record<string, unknown> = { driveRpm: 410, ...JSON.parse(process.env.BOT ?? '{}') };
 const baseFile = (s: Side) => path.join(ROOT, `src/auto/trees/auto/wall-sweep-pair-${s}.json`);
 const args = process.argv.slice(2), isWorker = args.includes('--worker'), pos = args.filter(a => !a.startsWith('--'));
 
@@ -72,25 +81,30 @@ const KINDS: Record<Side, Kind> = {
 };
 
 // ---- scoring trees in the simulator (worker side) ----
-interface Row { id: string; auto: number; worst: number; fourTipRate: number; tip4: number; hopper: number; firstTip: number; error?: string }
+interface Row { id: string; auto: number; worst: number; fourTipRate: number; tip4: number; hopper: number; firstTip: number; dist: number; vmax: number; error?: string }
 async function score(trees: Node[], seeds: number[], alliance: Alliance, slot: number): Promise<Row[]> {
   const RAPIER = (await import('@dimforge/rapier3d-compat')).default; await RAPIER.init();
-  const { Coach } = await import('../src/auto/coach'); const { DT, Sim } = await import('../src/sim/world'); const { addAutoTree } = await import('../src/auto/onboard');
+  const { defaultBot, robotConfig } = await import('../src/setup'); const { Coach } = await import('../src/auto/coach'); const { DT, Sim } = await import('../src/sim/world'); const { addAutoTree } = await import('../src/auto/onboard');
   const out: Row[] = [];
   for (const tree of trees) {
-    try { addAutoTree(tree); } catch (e) { out.push({ id: tree.id, auto: 0, worst: 0, fourTipRate: 0, tip4: 30, hopper: 0, firstTip: 0, error: String(e).slice(0, 200) }); continue; }
-    let auto = 0, hop = 0, firstTip = 0, tipRuns = 0, worst = Infinity, four = 0, tip4 = 0;
+    try { addAutoTree(tree); } catch (e) { out.push({ id: tree.id, auto: 0, worst: 0, fourTipRate: 0, tip4: 30, hopper: 0, firstTip: 0, dist: 0, vmax: 0, error: String(e).slice(0, 200) }); continue; }
+    let auto = 0, hop = 0, firstTip = 0, tipRuns = 0, worst = Infinity, four = 0, tip4 = 0, dist = 0, vmax = 0;
     for (const seed of seeds) {
-      const sim = new Sim(RAPIER, undefined, 'full', seed, { opponent: true, partners: true }); sim.start();
+      const configFor = (a: Alliance, sl: number) => robotConfig({ ...defaultBot((a === 'red' ? 0 : 2) + sl), ...(a === alliance && sl === slot ? BOT : {}) } as any);
+      const sim = new Sim(RAPIER, undefined, 'full', seed, { opponent: true, partners: true, configFor } as any); sim.start();
+      const ti = sim.robots.findIndex(r => r.alliance === alliance && r.slot === slot), every = Math.round(0.25 / DT); let steps = 0, lx = 0, lz = 0, first = true;
       const cs = sim.robots.map(r => { const c = new Coach(); if (r.alliance === alliance && r.slot === slot) c.autoOverride = tree.id; return c; });
       const tipTimes: number[] = [];
-      while (sim.phase === 'auto') { sim.step(cs.map((c, i) => c.update(sim.view(i), DT)), cs.map(() => true)); while (tipTimes.length < sim.hives[alliance].tips) tipTimes.push(30 - sim.timer); }
+      while (sim.phase === 'auto') {
+        sim.step(cs.map((c, i) => c.update(sim.view(i), DT)), cs.map(() => true));
+        if (++steps % every === 0) { const q = sim.robots[ti].body.translation(); if (!first) { const d = Math.hypot(q.x - lx, q.z - lz); dist += d; vmax = Math.max(vmax, d / 0.25); } first = false; lx = q.x; lz = q.z; }
+        while (tipTimes.length < sim.hives[alliance].tips) tipTimes.push(30 - sim.timer); }
       const s = sim.score(alliance), pts = s.leave + s.autoPark + s.autoTips; auto += pts; worst = Math.min(worst, pts);
       hop += sim.robots.filter(r => r.alliance === alliance).reduce((n, r) => n + r.carried.length, 0) / 2;
       if (tipTimes.length) { firstTip += tipTimes[0]; tipRuns++; } if (tipTimes.length >= 4) four++; tip4 += tipTimes[3] ?? 30; // a missing 4th TIP counts as 30 s
     }
     const n = seeds.length;
-    out.push({ id: tree.id, auto: auto / n, worst, fourTipRate: four / n, tip4: tip4 / n, hopper: hop / n, firstTip: tipRuns ? firstTip / tipRuns : 0 });
+    out.push({ id: tree.id, auto: auto / n, worst, fourTipRate: four / n, tip4: tip4 / n, hopper: hop / n, firstTip: tipRuns ? firstTip / tipRuns : 0, dist: dist / n, vmax });
   }
   return out;
 }
@@ -104,6 +118,7 @@ if (isWorker) {
 const cores = (os.availableParallelism?.() ?? os.cpus().length), [candArg = '200', seedArg = '6', workArg = String(Math.max(1, cores - 1)), rngArg = '1'] = pos;
 let state = Number(rngArg) >>> 0;
 const rng = () => { state = (state + 0x6d2b79f5) >>> 0; let t = state; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+const alliances = (args.find(a => a.startsWith('--alliances='))?.split('=')[1] ?? 'red').split(',') as Alliance[];
 const nCand = Number(candArg), seeds = Array.from({ length: Number(seedArg) }, (_, k) => 3000 + 17 * k), nWork = Math.max(1, Number(workArg));
 
 // One candidate list per side, shared by both alliances. Candidate 0 is the unchanged default, as the yardstick.
@@ -113,6 +128,10 @@ for (const side of ['right', 'left'] as Side[]) {
   cands[side][0].tree.id = cands[side][0].id;
   for (let i = 1; i < nCand; i++) { const id = `${side}-${String(i).padStart(3, '0')}`, genome = KINDS[side].randomGenome(rng); cands[side].push({ id, genome, tree: KINDS[side].build(genome, id) }); }
 }
+
+// The backup every start position needs: LEAVE and PARK only, no launching. It is scored but never ranked.
+const backupTree = JSON.parse(fs.readFileSync(path.join(ROOT, 'src/auto/trees/auto/leave-and-park.json'), 'utf8')) as Node;
+for (const side of ['right', 'left'] as Side[]) { const id = `${side}-backup-leave-park`; cands[side].push({ id, genome: { backup: true }, tree: { ...structuredClone(backupTree), id } }); }
 
 const tmp = fs.mkdtempSync(path.join(ROOT, 'experiments', '.auto-search-'));
 const runWorker = (file: string, alliance: Alliance, slot: number) => new Promise<Row[]>(done => {
@@ -124,18 +143,32 @@ const runWorker = (file: string, alliance: Alliance, slot: number) => new Promis
 // Ranking key, rounded so that tiny differences count as ties and fall through to the next criterion.
 const key = (r: Row) => [Math.round(r.auto), Math.round(r.worst), -Math.round(r.tip4 * 2) / 2, Math.round(r.hopper * 2) / 2];
 const compare = (a: Row, b: Row) => { const x = key(a), y = key(b); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return y[i] - x[i]; return 0; };
-const report: Record<string, unknown[]> = {};
-for (const alliance of ['red', 'blue'] as Alliance[]) for (const side of ['right', 'left'] as Side[]) {
+const report: Record<string, unknown> = {};
+for (const alliance of alliances) for (const side of ['right', 'left'] as Side[]) {
   const label = `${alliance} ${side}`, slot = side === 'right' ? 0 : 1, list = cands[side];
   const chunks = Array.from({ length: nWork }, (_, w) => list.filter((_, i) => i % nWork === w).map(c => c.tree));
   const files = chunks.map((c, w) => { const f = path.join(tmp, `${alliance}-${side}-${w}.json`); fs.writeFileSync(f, JSON.stringify(c)); return f; });
-  const rows = (await Promise.all(files.map(f => runWorker(f, alliance, slot)))).flat().filter(r => !r.error).sort(compare);
+  const all = (await Promise.all(files.map(f => runWorker(f, alliance, slot)))).flat().filter(r => !r.error);
+  const backup = all.find(r => r.id.endsWith('-backup-leave-park')), rows = all.filter(r => !r.id.endsWith('-backup-leave-park')).sort(compare);
   const base = rows.find(r => r.id.endsWith('-000-default')), top = rows.slice(0, 10), byId = new Map(list.map(c => [c.id, c]));
+  const show = (r: Row, tag: string) => `${tag.padStart(4)}  ${r.id.padEnd(22)} ${r.auto.toFixed(1).padStart(8)}  ${r.worst.toFixed(0).padStart(5)}  ${(r.fourTipRate * 100).toFixed(0).padStart(5)}%  ${r.tip4.toFixed(1).padStart(10)}  ${r.hopper.toFixed(2).padStart(6)}  ${r.dist.toFixed(1).padStart(6)}  ${r.vmax.toFixed(2).padStart(6)}`;
+  const header = 'rank  id                      AUTO pts  worst  4 TIPS  4th TIP (s)  hopper  dist m  top m/s';
   console.log(`\n=== ${label} start: ${rows.length}/${nCand} candidates over ${seeds.length} seeds. Default AUTO ${base ? base.auto.toFixed(1) : '?'} pts ===`);
-  console.log('rank  id                AUTO pts  worst  4 TIPS  4th TIP (s)  hopper');
-  top.forEach((r, i) => console.log(`${String(i + 1).padStart(4)}  ${r.id.padEnd(16)} ${r.auto.toFixed(1).padStart(8)}  ${r.worst.toFixed(0).padStart(5)}  ${(r.fourTipRate * 100).toFixed(0).padStart(5)}%  ${r.tip4.toFixed(1).padStart(10)}  ${r.hopper.toFixed(2).padStart(6)}`));
-  report[label] = top.map(r => ({ ...r, genome: byId.get(r.id)!.genome, tree: byId.get(r.id)!.tree }));
+  console.log(header); top.forEach((r, i) => console.log(show(r, String(i + 1))));
+  // Variety: the best candidate of each different structure, at most 3, each within 10 AUTO points of the best.
+  const structure = (g: Genome) => ['flower', 'secondSweep', 'midSweep', 'rearShots', 'lastCycle'].filter(k => k in g).map(k => `${k}:${g[k] ? 1 : 0}`).concat(`launch:${(Math.round(Math.abs(g.launchZ as number) * 10) / 10)}`).join(','); // which optional steps it keeps, and the launch spot to 0.1 m
+  const shortlist: Row[] = [], seen = new Set<string>();
+  for (const r of rows) { const sg = structure(byId.get(r.id)!.genome); if (!seen.has(sg) && shortlist.length < 3 && r.auto >= rows[0].auto - 10) { seen.add(sg); shortlist.push(r); } } // a routine that is far behind the best is not a useful alternative
+  console.log(`--- shortlist: best of each different structure, plus the backup`); console.log(header);
+  shortlist.forEach((r, i) => console.log(show(r, `S${i + 1}`))); if (backup) console.log(show(backup, 'BKP'));
+  // Sanity flags. The simulator already uses the tested robot's speed, so these are checks on top of that.
+  const vTop = (BOT.driveRpm as number) * 2 * Math.PI / 60 * 0.052 * 0.81;
+  for (const r of shortlist) {
+    const w = [r.fourTipRate < 1 ? `only ${(r.fourTipRate * 100).toFixed(0)}% of seeds reach 4 TIPS` : '', r.firstTip > 10 ? `first TIP late (${r.firstTip.toFixed(1)} s)` : '', r.vmax > vTop * 1.1 ? `top speed ${r.vmax.toFixed(2)} m/s is above the robot's about ${vTop.toFixed(2)} m/s` : ''].filter(Boolean);
+    if (w.length) console.log(`  check ${r.id}: ${w.join('; ')}`);
+  }
+  report[label] = { bot: BOT, top10: top.map(r => ({ ...r, genome: byId.get(r.id)!.genome, tree: byId.get(r.id)!.tree })), shortlist: shortlist.map(r => ({ ...r, genome: byId.get(r.id)!.genome, tree: byId.get(r.id)!.tree })), backup: backup ? { ...backup, tree: byId.get(backup.id)!.tree } : null } as any;
 }
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.writeFileSync(path.join(ROOT, 'auto-search-top10.json'), JSON.stringify(report, null, 1));
-console.log('\nWrote auto-search-top10.json (per start position: the top 10 with genome and full tree).');
+console.log('\nWrote auto-search-top10.json (per start position: top 10, shortlist and backup, each with its settings and full tree).');
