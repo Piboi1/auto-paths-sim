@@ -43,6 +43,30 @@ It writes `auto-search-top10.json` in the sim repo. Each entry has its settings 
   shortlisted routine misses 4 TIPS on some seeds, has a late first TIP, or exceeds the robot's top speed.
   These don't replace looking at the path: check that every pose is reachable and clear of obstacles for your robot.
 
+## See the results in the simulator
+
+The sim has no import button yet, so `export-to-sim.ts` adds the routines that the search found to your local copy:
+
+1. Copy `export-to-sim.ts` into the sim's `scripts/` folder (next to `auto-search.ts`) and run it after a search:
+
+   ```
+   npx tsx scripts/export-to-sim.ts          # the shortlist and backups
+   npx tsx scripts/export-to-sim.ts --top10  # the top 10 as well
+   ```
+
+   It writes `src/auto/trees/auto/found-<id>.json` and adds those files to the list in `src/auto/onboard.ts`.
+2. Start the sim with `npm run dev` and open the address it prints.
+3. Click the gear icon next to a robot's number, and set its **AUTO plan** to one of the `Found: ...` plans. They are
+   listed by start position, so a right-start robot (R0 or B0) shows the right-start ones and a left-start robot (R1 or
+   B1) the left-start ones. Start the match to watch it. **Edit AUTO paths** in the gear menu shows the plan's steps.
+4. Undo it when you're done (these are local experiments, not for committing):
+
+   ```
+   git checkout src/auto/onboard.ts && rm src/auto/trees/auto/found-*.json
+   ```
+
+Run it again after each new search; it replaces its earlier `found-` files.
+
 ## What it does
 
 - Each start position gets its own random variants of the sim's default tree (`wall-sweep-pair-right` or `-left`):
