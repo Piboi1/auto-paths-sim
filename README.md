@@ -11,7 +11,7 @@ positions (red right, red left, blue right, blue left) and prints the top 10 of 
 3. Run:
 
    ```
-   npx tsx scripts/auto-search.ts [candidates=200] [seeds=6] [workers=CPU cores - 1] [rngSeed=1] [--alliances=red]
+   npx tsx scripts/auto-search.ts [candidates=200] [seeds=6] [workers=CPU cores - 1] [rngSeed=1] [--alliances=red] [--partners=default,meta,slow,sloppy]
    ```
 
    Start small, for example `40 4 4 1`. A full 200 x 6 run across all four starts may take about an hour (a rough guess).
@@ -67,16 +67,37 @@ The sim has no import button yet, so `export-to-sim.ts` adds the routines that t
 
 Run it again after each new search; it replaces its earlier `found-` files.
 
+## Testing against different partners
+
+You won't know your partner until you get there, so each candidate is run against several partner setups. The partner
+and both opponents all use the named setup (your own robot stays as set by `BOT`):
+
+| Setup | The other three robots |
+|---|---|
+| `default` | The sim's default robot (600 rpm, 38 cm, 10 kg) |
+| `meta` | The sim's light, fast "meta build" (500 rpm, 30.5 cm, 7 kg, dual intake, catapult) |
+| `slow` | Slow and heavy: 312 rpm, 28 lb |
+| `sloppy` | 3x the launch error and 80% intake success |
+
+The table's last column shows the mean AUTO points per setup, in that order, for example `96/96/76/56`. Use
+`--partners=default,meta` to test fewer setups: the run time grows with the number of setups.
+
+Limits: AUTO points are for the whole alliance, so a poor partner lowers every candidate's score. The comparison is fair
+between candidates (they all get the same partner), but a low "worst setup" number mostly measures what a weak partner
+costs, not a flaw in the routine. The sim can't model a partner that runs its own unknown AUTO, doesn't show up, or has
+a human driver. Ask your partner before the match where they start, where they launch from and what they collect.
+
 ## What it does
 
 - Each start position gets its own random variants of the sim's default tree (`wall-sweep-pair-right` or `-left`):
   launch spot, shot counts, sweep angle and reach, waits, and whether the FLOWER step, second sweep or last cycle runs.
 - Candidate 0 is the unchanged default, as a yardstick.
 - Candidates are ranked in this order; a later criterion only matters when the earlier ones tie:
-  1. mean AUTO points (LEAVE + AUTO PARK + TIPs),
-  2. the worst seed's AUTO points (reliability),
-  3. the time of the 4th TIP (earlier is better; a missing one counts as 30 s),
-  4. elements still in the hoppers when AUTO ends.
+  1. mean AUTO points in the **worst partner setup** (see below),
+  2. mean AUTO points over all setups,
+  3. the worst single run's AUTO points,
+  4. the time of the 4th TIP (earlier is better; a missing one counts as 30 s),
+  5. elements still in the hoppers when AUTO ends.
 - Left-start launch headings stay at 126 degrees or more: below that, a test run lost the camera's view of the rear
   CELL's tags and the later TIPs never happened.
 - The partner and the other alliance run their default AUTO.
